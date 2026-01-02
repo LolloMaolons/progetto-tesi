@@ -1,0 +1,9 @@
+{
+  "name": "ws-events",
+  "version": "0.1.0",
+  "type": "module",
+  "dependencies": {
+    "redis": "^4.6.13",
+    "ws": "^8.18.0"
+  }
+}

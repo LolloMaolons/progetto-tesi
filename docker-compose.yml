@@ -1,0 +1,86 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: appdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  api-rest:
+    build: ./api-rest
+    environment:
+      DATABASE_URL: postgres://app:app@postgres:5432/appdb
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - postgres
+      - redis
+    ports:
+      - "8080:8080"
+
+  gateway-graphql:
+    build: ./gateway-graphql
+    environment:
+      REST_BASE_URL: http://api-rest:8080
+    depends_on:
+      - api-rest
+    ports:
+      - "4000:4000"
+
+  ws-events:
+    build: ./ws-events
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    depends_on:
+      - redis
+    ports:
+      - "7070:7070"
+
+  mcp-server-catalog:
+    build: ./mcp-server-catalog
+    stdin_open: true
+    tty: true
+    depends_on:
+      - api-rest
+      - redis
+      - postgres
+
+  mcp-server-orders:
+    build: ./mcp-server-orders
+    stdin_open: true
+    tty: true
+    depends_on:
+      - api-rest
+      - redis
+      - postgres
+
+  mcp-server-ops:
+    build: ./mcp-server-ops
+    stdin_open: true
+    tty: true
+    depends_on:
+      - api-rest
+      - redis
+      - postgres
+
+  mcp-host:
+    build: ./mcp-host
+    stdin_open: true
+    tty: true
+    depends_on:
+      - mcp-server-catalog
+      - mcp-server-orders
+      - mcp-server-ops
+
+volumes:
+  pgdata:
