@@ -1,6 +1,7 @@
 import sys, json, uuid, os, requests
 
-REST_BASE = os.getenv("REST_BASE_URL", "http://api-rest:8080")
+# Defaulta a localhost fuori da Docker; in Docker userai api-rest:8080
+REST_BASE = os.getenv("REST_BASE_URL", "http://localhost:8080")
 
 def respond(id, result=None, error=None):
     msg = {"jsonrpc": "2.0", "id": id}
