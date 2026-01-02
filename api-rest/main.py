@@ -1,7 +1,10 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
-import uvicorn
+import uvicorn, os, json, redis
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+r = redis.Redis.from_url(REDIS_URL)
 
 app = FastAPI(title="API REST - Catalog/Orders/Users")
 
@@ -11,7 +14,6 @@ class Product(BaseModel):
     price: float
     stock: int
 
-# In-memory stub (poi Postgres)
 DB_PRODUCTS = {
     1: Product(id=1, name="Laptop Pro", price=1499.0, stock=10),
     2: Product(id=2, name="Mouse", price=29.0, stock=200),
@@ -29,12 +31,22 @@ def get_product(pid: int):
     return p
 
 @app.patch("/products/{pid}", response_model=Product)
-def update_stock(pid: int, stock: int):
+def update_product(pid: int, stock: int | None = None, price: float | None = None):
     p = DB_PRODUCTS.get(pid)
     if not p:
         raise HTTPException(404, "Not found")
-    p.stock = stock
-    # TODO: publish event to Redis
+    if stock is not None:
+        p.stock = stock
+        try:
+            r.publish("events", json.dumps({"type": "stock_update", "id": pid, "stock": stock}))
+        except Exception as e:
+            print("Redis publish stock_update error:", e, flush=True)
+    if price is not None:
+        p.price = price
+        try:
+            r.publish("events", json.dumps({"type": "price_update", "id": pid, "price": price}))
+        except Exception as e:
+            print("Redis publish price_update error:", e, flush=True)
     return p
 
 if __name__ == "__main__":

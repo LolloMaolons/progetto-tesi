@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   postgres:
     image: postgres:16-alpine
@@ -20,8 +18,8 @@ services:
   api-rest:
     build: ./api-rest
     environment:
-      DATABASE_URL: postgres://app:app@postgres:5432/appdb
       REDIS_URL: redis://redis:6379/0
+      DATABASE_URL: postgres://app:app@postgres:5432/appdb  # da usare quando integri Postgres
     depends_on:
       - postgres
       - redis
@@ -50,37 +48,22 @@ services:
     build: ./mcp-server-catalog
     stdin_open: true
     tty: true
+    environment:
+      REST_BASE_URL: http://api-rest:8080
     depends_on:
       - api-rest
       - redis
-      - postgres
-
-  mcp-server-orders:
-    build: ./mcp-server-orders
-    stdin_open: true
-    tty: true
-    depends_on:
-      - api-rest
-      - redis
-      - postgres
-
-  mcp-server-ops:
-    build: ./mcp-server-ops
-    stdin_open: true
-    tty: true
-    depends_on:
-      - api-rest
-      - redis
-      - postgres
 
   mcp-host:
     build: ./mcp-host
     stdin_open: true
     tty: true
+    environment:
+      REST_BASE_URL: http://api-rest:8080
+      REDIS_URL: redis://redis:6379/0
     depends_on:
       - mcp-server-catalog
-      - mcp-server-orders
-      - mcp-server-ops
+      - redis
 
 volumes:
   pgdata:
