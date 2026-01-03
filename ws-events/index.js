@@ -8,7 +8,6 @@ const wss = new WebSocketServer({ port: 7070 });
   const sub = createClient({ url: REDIS_URL });
   await sub.connect();
   await sub.subscribe('events', (message) => {
-    // broadcast to all clients
     wss.clients.forEach(c => {
       if (c.readyState === WebSocket.OPEN) c.send(message);
     });
