@@ -165,7 +165,7 @@ const server = new ApolloServer({
     const authHeader = req.headers.authorization || '';
     let user = { role: 'viewer' };
     if (authHeader.startsWith('Bearer ')) {
-      const token = authHeader.substring(7);
+      const token = authHeader.slice(7);
       user = verifyToken(token);
     } else if (AUTH_ENABLED && !authHeader) {
       throw new Error('Authorization required');
