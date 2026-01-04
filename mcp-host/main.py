@@ -1,12 +1,13 @@
 import time
 import requests
-import json
 import os
+import math
 
 REST_BASE = os.getenv("REST_BASE_URL", "http://localhost:8080")
 PRODUCT_ID = 1
 THRESHOLD = 15
 DISCOUNT = 10.0
+EPS = 0.01 
 
 def now_ms():
     return int(time.time() * 1000)
@@ -29,12 +30,19 @@ def apply_discount(pid, percent):
     r = requests.get(f"{REST_BASE}/products/{pid}")
     r.raise_for_status()
     cur = r.json()
-    new_price = round(cur["price"] * (1 - percent / 100), 2)
-    r2 = requests.patch(f"{REST_BASE}/products/{pid}", params={"price": new_price})
+
+    target_price = round(cur["price"] * (1 - percent / 100), 2)
+
+    if math.isclose(cur["price"], target_price, abs_tol=EPS):
+        dt = (time.time() - t0) * 1000
+        log(f"applyDiscount skipped (already discounted) pid={pid} price={cur['price']} dt={dt:.2f} ms")
+        return dt, cur["price"]
+
+    r2 = requests.patch(f"{REST_BASE}/products/{pid}", params={"price": target_price})
     r2.raise_for_status()
     dt = (time.time() - t0) * 1000
-    log(f"applyDiscount pid={pid} percent={percent}% new_price={new_price} dt={dt:.2f} ms")
-    return dt, new_price
+    log(f"applyDiscount pid={pid} percent={percent}% new_price={target_price} dt={dt:.2f} ms")
+    return dt, target_price
 
 def notify_pending(pid):
     t0 = time.time()
@@ -54,6 +62,5 @@ if __name__ == "__main__":
 
     check = requests.get(f"{REST_BASE}/products/{target}").json()
     log(f"State after actions: id={target} price={check['price']} stock={check['stock']}")
-
     total = dt_search + dt_disc + dt_notify
     log(f"Total pipeline time={total:.2f} ms")
