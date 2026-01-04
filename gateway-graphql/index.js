@@ -1,5 +1,74 @@
-import { ApolloServer, gql } from 'apollo-server';
+import { ApolloServer } from 'apollo-server';
+import { gql } from 'apollo-server';
 import fetch from 'node-fetch';
+import jwt from 'jsonwebtoken';
+import depthLimit from 'graphql-depth-limit';
+import { register, Counter, Histogram } from 'prom-client';
+import winston from 'winston';
+import http from 'http';
+
+// Configuration
+const REST_BASE = process.env.REST_BASE_URL || "http://localhost:8080";
+const LOW_STOCK_THRESHOLD = parseInt(process.env.LOW_STOCK_THRESHOLD || "10", 10);
+const JWT_SECRET = process.env.JWT_SECRET || "";
+const JWT_ALGORITHM = process.env.JWT_ALGORITHM || "HS256";
+const AUTH_ENABLED = !!JWT_SECRET;
+const GRAPHQL_DEPTH_LIMIT = parseInt(process.env.GRAPHQL_DEPTH_LIMIT || "10", 10);
+const INTROSPECTION_ENABLED = process.env.INTROSPECTION_ENABLED !== "false";
+const RATE_LIMIT_PER_MIN = parseInt(process.env.RATE_LIMIT_PER_MIN || "100", 10);
+
+// Structured logging
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.json()
+  ),
+  transports: [new winston.transports.Console()],
+});
+
+// Prometheus metrics
+const requestCounter = new Counter({
+  name: 'graphql_requests_total',
+  help: 'Total GraphQL requests',
+  labelNames: ['operation', 'status'],
+});
+
+const requestDuration = new Histogram({
+  name: 'graphql_request_duration_seconds',
+  help: 'GraphQL request duration',
+  labelNames: ['operation'],
+});
+
+const errorCounter = new Counter({
+  name: 'graphql_errors_total',
+  help: 'Total GraphQL errors',
+  labelNames: ['operation'],
+});
+
+// Simple rate limiting (per IP)
+const rateLimitMap = new Map();
+setInterval(() => rateLimitMap.clear(), 60000); // Reset every minute
+
+function checkRateLimit(ip) {
+  const count = rateLimitMap.get(ip) || 0;
+  if (count >= RATE_LIMIT_PER_MIN) {
+    throw new Error('Rate limit exceeded');
+  }
+  rateLimitMap.set(ip, count + 1);
+}
+
+// Auth context
+function verifyToken(token) {
+  if (!AUTH_ENABLED) {
+    return { role: 'admin' }; // No auth, full access
+  }
+  try {
+    return jwt.verify(token, JWT_SECRET, { algorithms: [JWT_ALGORITHM] });
+  } catch (err) {
+    throw new Error('Invalid or expired token');
+  }
+}
 
 const typeDefs = gql`
   type Product {
@@ -19,28 +88,31 @@ const typeDefs = gql`
   }
 `;
 
-const REST_BASE = process.env.REST_BASE_URL || "http://localhost:8080";
-const LOW_STOCK_THRESHOLD = parseInt(process.env.LOW_STOCK_THRESHOLD || "10", 10);
-
 const resolvers = {
   Product: {
     lowStock: (parent) => parent.stock <= LOW_STOCK_THRESHOLD,
   },
   Query: {
-    product: async (_, { id }) => {
-      const res = await fetch(`${REST_BASE}/products/${id}`);
+    product: async (_, { id }, context) => {
+      const res = await fetch(`${REST_BASE}/products/${id}`, {
+        headers: context.authHeader ? { Authorization: context.authHeader } : {},
+      });
       if (res.status !== 200) return null;
       return res.json();
     },
-    products: async (_, { limit, category }) => {
+    products: async (_, { limit, category }, context) => {
       const qs = new URLSearchParams();
       if (limit) qs.append("limit", limit);
       if (category) qs.append("category", category);
-      const res = await fetch(`${REST_BASE}/products${qs.toString() ? "?" + qs.toString() : ""}`);
+      const res = await fetch(`${REST_BASE}/products${qs.toString() ? "?" + qs.toString() : ""}`, {
+        headers: context.authHeader ? { Authorization: context.authHeader } : {},
+      });
       return res.json();
     },
-    recommendations: async (_, { id, limit }) => {
-      const res = await fetch(`${REST_BASE}/products/${id}/recommendations?limit=${limit}`);
+    recommendations: async (_, { id, limit }, context) => {
+      const res = await fetch(`${REST_BASE}/products/${id}/recommendations?limit=${limit}`, {
+        headers: context.authHeader ? { Authorization: context.authHeader } : {},
+      });
       if (res.status !== 200) return [];
       return res.json();
     },
@@ -50,7 +122,92 @@ const resolvers = {
 const server = new ApolloServer({
   typeDefs,
   resolvers,
-  plugins: [], // disabilita tracing extra
+  introspection: INTROSPECTION_ENABLED,
+  validationRules: [depthLimit(GRAPHQL_DEPTH_LIMIT)],
+  context: ({ req }) => {
+    const requestId = req.headers['x-request-id'] || `${Date.now()}`;
+    const traceId = req.headers['x-trace-id'] || requestId;
+    const ip = req.ip || req.connection.remoteAddress;
+
+    // Rate limiting
+    try {
+      checkRateLimit(ip);
+    } catch (err) {
+      throw new Error('Rate limit exceeded');
+    }
+
+    // Auth
+    const authHeader = req.headers.authorization || '';
+    let user = { role: 'viewer' };
+    if (authHeader.startsWith('Bearer ')) {
+      const token = authHeader.substring(7);
+      user = verifyToken(token);
+    } else if (AUTH_ENABLED && !authHeader) {
+      throw new Error('Authorization required');
+    }
+
+    logger.info('GraphQL request', {
+      requestId,
+      traceId,
+      ip,
+      operation: req.body?.operationName,
+    });
+
+    return {
+      user,
+      authHeader,
+      requestId,
+      traceId,
+    };
+  },
+  plugins: [
+    {
+      async requestDidStart(requestContext) {
+        const start = Date.now();
+        const operation = requestContext.request.operationName || 'anonymous';
+
+        return {
+          async didEncounterErrors(ctx) {
+            errorCounter.labels(operation).inc();
+            logger.error('GraphQL error', {
+              operation,
+              errors: ctx.errors.map(e => e.message),
+              requestId: ctx.context.requestId,
+            });
+          },
+          async willSendResponse(ctx) {
+            const duration = (Date.now() - start) / 1000;
+            const status = ctx.errors ? 'error' : 'success';
+            requestCounter.labels(operation, status).inc();
+            requestDuration.labels(operation).observe(duration);
+            logger.info('GraphQL response', {
+              operation,
+              status,
+              duration_ms: Math.round(duration * 1000),
+              requestId: ctx.context.requestId,
+            });
+          },
+        };
+      },
+    },
+  ],
 });
 
-server.listen({ port: 4000 }).then(({ url }) => console.log(`GraphQL ready at ${url}`));
+// Metrics endpoint
+const metricsServer = http.createServer(async (req, res) => {
+  if (req.url === '/metrics') {
+    res.setHeader('Content-Type', register.contentType);
+    res.end(await register.metrics());
+  } else {
+    res.statusCode = 404;
+    res.end('Not Found');
+  }
+});
+
+metricsServer.listen(9090, () => {
+  logger.info('Metrics server ready at http://localhost:9090/metrics');
+});
+
+server.listen({ port: 4000 }).then(({ url }) => {
+  logger.info(`GraphQL server ready at ${url}`);
+});

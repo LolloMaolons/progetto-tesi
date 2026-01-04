@@ -1,10 +1,25 @@
 import time
 import requests
 import os
+import logging
+import sys
+from pythonjsonlogger import jsonlogger
 
 REST_BASE = os.getenv("REST_BASE_URL", "http://localhost:8080")
 THRESHOLD = 15
 DISCOUNT = 10.0
+
+# Structured logging
+logger = logging.getLogger("mcp-host")
+logHandler = logging.StreamHandler(sys.stdout)
+formatter = jsonlogger.JsonFormatter(
+    "%(asctime)s %(name)s %(levelname)s %(message)s %(trace_id)s"
+)
+logHandler.setFormatter(formatter)
+logger.addHandler(logHandler)
+logger.setLevel(logging.INFO)
+
+TRACE_ID = f"mcp-{int(time.time() * 1000)}"
 
 BASE_PRICES = {
     1: 1499.0,
@@ -32,8 +47,8 @@ BASE_PRICES = {
 def now_ms():
     return int(time.time() * 1000)
 
-def log(msg):
-    print(f"[{now_ms()}] {msg}", flush=True)
+def log(msg, **extra):
+    logger.info(msg, extra={"trace_id": TRACE_ID, **extra})
 
 def fetch_all():
     resp = requests.get(f"{REST_BASE}/products")
@@ -49,7 +64,7 @@ def run():
     t0 = time.time()
     items = fetch_all()
     dt_fetch = (time.time() - t0) * 1000
-    log(f"Fetched {len(items)} products in {dt_fetch:.2f} ms")
+    log(f"Fetched {len(items)} products in {dt_fetch:.2f} ms", products_count=len(items), fetch_time_ms=dt_fetch)
 
     total_ops = 0
     for p in items:
@@ -62,19 +77,23 @@ def run():
         if stock <= THRESHOLD:
             if cur_price > target_price:
                 patch_price(pid, target_price)
-                log(f"applyDiscount pid={pid} stock={stock} price {cur_price} -> {target_price}")
+                log(f"applyDiscount pid={pid} stock={stock} price {cur_price} -> {target_price}", 
+                    action="applyDiscount", pid=pid, stock=stock, old_price=cur_price, new_price=target_price)
                 total_ops += 1
             else:
-                log(f"skipDiscount (already discounted) pid={pid} stock={stock} price={cur_price} target={target_price}")
+                log(f"skipDiscount (already discounted) pid={pid} stock={stock} price={cur_price} target={target_price}",
+                    action="skipDiscount", pid=pid, stock=stock, price=cur_price)
         else:
             if cur_price < base_price:
                 patch_price(pid, base_price)
-                log(f"resetPrice pid={pid} stock={stock} price {cur_price} -> {base_price}")
+                log(f"resetPrice pid={pid} stock={stock} price {cur_price} -> {base_price}",
+                    action="resetPrice", pid=pid, stock=stock, old_price=cur_price, new_price=base_price)
                 total_ops += 1
             else:
-                log(f"noChange pid={pid} stock={stock} price={cur_price}")
+                log(f"noChange pid={pid} stock={stock} price={cur_price}",
+                    action="noChange", pid=pid, stock=stock, price=cur_price)
 
-    log(f"Ops executed: {total_ops}")
+    log(f"Ops executed: {total_ops}", total_operations=total_ops)
 
 if __name__ == "__main__":
     run()
