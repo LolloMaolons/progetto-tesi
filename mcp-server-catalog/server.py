@@ -39,7 +39,6 @@ def handle(req):
             pid = int(args.get("product_id"))
             percent = float(args.get("percent", 0))
             threshold = int(args.get("threshold", 5))
-            # GET product
             prod = requests.get(f"{REST_BASE}/products/{pid}")
             if prod.status_code != 200:
                 return respond(id_, error="product not found")
