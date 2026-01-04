@@ -46,16 +46,43 @@ const errorCounter = new Counter({
   labelNames: ['operation'],
 });
 
-// Simple rate limiting (per IP)
+// Sliding window rate limiting (per IP)
+// This implementation provides better distribution than simple interval resets
+// and prevents rate limit circumvention at window boundaries
 const rateLimitMap = new Map();
-setInterval(() => rateLimitMap.clear(), 60000); // Reset every minute
+
+// Clean up old entries every 30 seconds
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, data] of rateLimitMap.entries()) {
+    if (now - data.windowStart > 60000) {
+      rateLimitMap.delete(ip);
+    }
+  }
+}, 30000);
 
 function checkRateLimit(ip) {
-  const count = rateLimitMap.get(ip) || 0;
-  if (count >= RATE_LIMIT_PER_MIN) {
-    throw new Error('Rate limit exceeded');
+  const now = Date.now();
+  const data = rateLimitMap.get(ip);
+  
+  if (!data) {
+    rateLimitMap.set(ip, { count: 1, windowStart: now });
+    return true;
   }
-  rateLimitMap.set(ip, count + 1);
+  
+  // Sliding window: reset if window expired
+  if (now - data.windowStart > 60000) {
+    rateLimitMap.set(ip, { count: 1, windowStart: now });
+    return true;
+  }
+  
+  // Within window
+  if (data.count >= RATE_LIMIT_PER_MIN) {
+    return false;
+  }
+  
+  data.count++;
+  return true;
 }
 
 // Auth context

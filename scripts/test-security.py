@@ -17,7 +17,7 @@ def generate_token(role="admin"):
     payload = {
         "sub": "testuser",
         "role": role,
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(hours=1)
+        "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(hours=1)
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 

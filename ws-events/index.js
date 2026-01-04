@@ -70,7 +70,19 @@ const wss = new WebSocketServer({
       }
 
       try {
-        const user = jwt.verify(token, JWT_SECRET, { algorithms: [JWT_ALGORITHM] });
+        const user = jwt.verify(token, JWT_SECRET, { 
+          algorithms: [JWT_ALGORITHM],
+          clockTolerance: 5  // Allow 5 seconds clock skew
+        });
+        
+        // Explicitly check expiration
+        if (user.exp && user.exp < Math.floor(Date.now() / 1000)) {
+          logger.warn('Connection rejected: token expired');
+          wsErrors.labels('auth_expired').inc();
+          cb(false, 401, 'Token expired');
+          return;
+        }
+        
         info.req.user = user;
       } catch (err) {
         logger.warn('Connection rejected: invalid token', { error: err.message });
@@ -84,26 +96,40 @@ const wss = new WebSocketServer({
   }
 });
 
-// Per-connection rate limiting
-const connectionRateLimits = new WeakMap();
+// Per-connection rate limiting using Map with connection IDs
+const connectionRateLimits = new Map();
 
-function checkMessageRateLimit(ws) {
+// Cleanup old/disconnected connections every 60 seconds
+setInterval(() => {
   const now = Date.now();
-  const limits = connectionRateLimits.get(ws) || { count: 0, windowStart: now };
+  for (const [connId, limits] of connectionRateLimits.entries()) {
+    // Remove entries older than 2 minutes (stale connections)
+    if (now - limits.lastAccess > 120000) {
+      connectionRateLimits.delete(connId);
+    }
+  }
+}, 60000);
+
+function checkMessageRateLimit(connectionId) {
+  const now = Date.now();
+  const limits = connectionRateLimits.get(connectionId) || { count: 0, windowStart: now, lastAccess: now };
+  
+  limits.lastAccess = now;
   
   if (now - limits.windowStart > 1000) {
     // New window
     limits.count = 1;
     limits.windowStart = now;
+    connectionRateLimits.set(connectionId, limits);
+    return true;
   } else {
     limits.count++;
     if (limits.count > MESSAGE_RATE_LIMIT) {
       return false;
     }
+    connectionRateLimits.set(connectionId, limits);
+    return true;
   }
-  
-  connectionRateLimits.set(ws, limits);
-  return true;
 }
 
 (async () => {
@@ -143,7 +169,8 @@ wss.on('connection', (ws, req) => {
   const user = req.user || { role: 'anonymous' };
   
   wsConnections.inc();
-  connectionRateLimits.set(ws, { count: 0, windowStart: Date.now() });
+  ws.connectionId = connectionId; // Store connection ID on ws object
+  connectionRateLimits.set(connectionId, { count: 0, windowStart: Date.now(), lastAccess: Date.now() });
   
   logger.info('WebSocket connection established', {
     connectionId,
@@ -159,7 +186,7 @@ wss.on('connection', (ws, req) => {
 
   ws.on('message', (data) => {
     // Rate limit check
-    if (!checkMessageRateLimit(ws)) {
+    if (!checkMessageRateLimit(connectionId)) {
       logger.warn('Message rate limit exceeded', { connectionId });
       wsErrors.labels('rate_limit').inc();
       ws.send(JSON.stringify({ type: 'error', message: 'Rate limit exceeded' }));
@@ -182,6 +209,6 @@ wss.on('connection', (ws, req) => {
 
   ws.on('close', () => {
     logger.info('WebSocket connection closed', { connectionId });
-    connectionRateLimits.delete(ws);
+    connectionRateLimits.delete(connectionId);
   });
 });

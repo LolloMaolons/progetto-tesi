@@ -2,7 +2,7 @@ from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import Response
 from pydantic import BaseModel
 from typing import List, Optional
-import uvicorn, os, json, redis, time, logging, sys
+import uuid
 from contextvars import ContextVar
 import jwt
 from slowapi import Limiter, _rate_limit_exceeded_handler
@@ -85,7 +85,7 @@ def require_role(required_role: str):
 # Middleware for request ID and logging
 @app.middleware("http")
 async def logging_middleware(request: Request, call_next):
-    request_id = request.headers.get("X-Request-ID", f"{int(time.time() * 1000)}")
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
     trace_id = request.headers.get("X-Trace-ID", request_id)
     request_id_ctx.set(request_id)
     
