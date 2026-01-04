@@ -16,7 +16,7 @@ Questa demo mostra come integrare i quattro paradigmi descritti nel Capitolo 1:
   - `catalog.applyDiscount(product_id, percent, threshold)` con guard-rail sullo stock.
 - `mcp-server-orders`: server MCP (mock) con tool:
   - `orders.notifyPending(product_id)` → pubblica `notify_pending` su Redis/WS.
-- `mcp-host`: host MCP (mock LLM) che orchestra i tool sopra.
+- `mcp-host`: host MCP (mock LLM) che orchestra i tool sopra (one-shot: esegue e termina).
 
 > Postgres **non è usato** in questa demo: il DB è in-memory. Redis è invece necessario.
 
@@ -52,30 +52,39 @@ query {
 }
 ```
 
-### 4) MCP (azione dell’agente)
+### 4) MCP (azione dell’agente, one-shot)
 ```bash
 cd mcp-host
 python main.py
 ```
-- `searchLowStock(threshold=15)` → trova i prodotti sotto soglia.
-- Se esistono low-stock, `applyDiscount` applica -10% (con controllo sullo stock) e pubblica `price_update`.
-- `orders.notifyPending` pubblica `notify_pending`.
+Logica aggiornata:
+- Sconta **tutti** i prodotti sotto soglia (`stock <= 15`) del 10%, solo se non già scontati.
+- Se un prodotto non è più low-stock, ripristina il prezzo base.
+- Pubblica `price_update`; `notify_pending` resta mock.
 
 ### 5) Verifica effetti
 - **WebSocket**: vedi `price_update` e `notify_pending`.
 - **REST**: `curl.exe http://localhost:8080/products/1`
 - **GraphQL**: stessa query di prima → `price` aggiornato e `lowStock` ricalcolato.
 
-### 6) Trigger manuale di eventi
-```bash
-curl.exe -X PATCH "http://localhost:8080/products/1?stock=5&price=1200"
+### 6) Trigger manuale di eventi / aggiornare stock o prezzo
+```powershell
+# Esempio: stock=5 e price=1200 sul prodotto 1
+$curl = "$env:SystemRoot\System32\curl.exe"
+& $curl -s -X PATCH "http://localhost:8080/products/1?stock=5&price=1200"
+
+# Solo stock
+& $curl -s -X PATCH "http://localhost:8080/products/1?stock=8"
+
+# Verifica
+& $curl -s "http://localhost:8080/products/1"
 ```
 
 ## Architettura logica
 - **REST (api-rest)**: stato autorevole (in-memory). Pubblica eventi su Redis.
 - **GraphQL (gateway-graphql)**: compone le risorse REST, aggiunge `lowStock`.
 - **WebSocket (ws-events)**: sottoscritto a Redis `events`, inoltra ai client.
-- **MCP**: orchestration: i server MCP espongono tool; l’host MCP coordina la sequenza (es. low-stock → sconto → notifica).
+- **MCP**: orchestration: i server MCP espongono tool; l’host MCP coordina la sequenza (es. low-stock → sconto → notifica). L’host è one-shot: puoi lanciarlo on-demand con `docker compose run --rm mcp-host`.
 
 ## Variabili d’ambiente principali
 - `REDIS_URL`: default `redis://redis:6379/0` (nei container); `redis://localhost:6379/0` fuori da Docker.
@@ -115,20 +124,20 @@ Conclusione: usa REST per operazioni semplici; GraphQL per viste composte/multip
   Tipico: mean ~41–47 ms, p95 ~39–69 ms con outlier warm-up.
   → WS molto più rapido; polling più frequente riduce latenza ma aumenta carico.
 
-## MCP – freschezza e azione (log tempi)
+## MCP – freschezza e azione (log tempi, sconto e reset)
 Esecuzione:
 ```powershell
 cd mcp-host
 $env:REST_BASE_URL="http://localhost:8080"
 python main.py
 ```
-Esempio run:
-- `searchLowStock`: 13.87 ms (3 item)
-- `applyDiscount`: 13.81 ms (10% su id=1, nuovo prezzo 1349.1)
+Esempio run (storico):
+- `searchLowStock`: ~12–14 ms (3 item)
+- `applyDiscount`: ~12–16 ms su prodotti low-stock (salta se già scontati)
 - `notifyPending`: ~0 ms
-- Totale pipeline: 27.68 ms
-- Stato finale coerente: REST/GraphQL mostrano `price=1349.1`, `stock=10`; `lowStock=true`.
-- Evento WS ricevuto: `{"type": "price_update", "id": 1, "price": 1349.1}`. Delta PATCH→evento misurabile con i timestamp (stessa finestra di pochi ms).
+- Totale pipeline: ~25–30 ms
+- Stato finale coerente: REST/GraphQL riflettono prezzo e lowStock aggiornati; evento WS `price_update` emesso.
+- Se un prodotto non è più low-stock, il prezzo viene riportato al base price.
 
 ## Estensioni possibili
 - Persistenza (Postgres con SQLAlchemy/psycopg in `api-rest`).
@@ -137,5 +146,6 @@ Esempio run:
 
 ## Troubleshooting
 - Nessun evento in WS: verifica `api-rest` pubblica su Redis e `ws-events` è up.
+- MCP (host) esce subito: è one-shot; lancialo con `docker compose run --rm mcp-host` quando `api-rest` è pronto.
 - MCP non risponde: controlla `REST_BASE_URL` e `REDIS_URL`; dipendenze `requests`/`redis`.
-- Guard-rail: `catalog.applyDiscount` rifiuta se `stock > threshold`. L’host salta lo sconto se non ci sono low-stock.
+- Guard-rail: `catalog.applyDiscount` rifiuta se `stock > threshold`. L’host salta lo sconto se già applicato e ripristina il prezzo base se non è più low-stock.
