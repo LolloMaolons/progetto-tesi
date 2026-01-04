@@ -157,9 +157,7 @@ const server = new ApolloServer({
     const ip = req.ip || req.connection.remoteAddress;
 
     // Rate limiting
-    try {
-      checkRateLimit(ip);
-    } catch (err) {
+    if (!checkRateLimit(ip)) {
       throw new Error('Rate limit exceeded');
     }
 

@@ -165,7 +165,7 @@ function checkMessageRateLimit(connectionId) {
 })();
 
 wss.on('connection', (ws, req) => {
-  const connectionId = `conn-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  const connectionId = `conn-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
   const user = req.user || { role: 'anonymous' };
   
   wsConnections.inc();
