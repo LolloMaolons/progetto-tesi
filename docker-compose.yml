@@ -3,31 +3,46 @@ services:
     image: redis:7-alpine
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
   api-rest:
     build: ./api-rest
     environment:
       REDIS_URL: redis://redis:6379/0
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     ports:
       - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   gateway-graphql:
     build: ./gateway-graphql
     environment:
       REST_BASE_URL: http://api-rest:8080
     depends_on:
-      - api-rest
+      api-rest:
+        condition: service_healthy
     ports:
       - "4000:4000"
+      - "9090:9090"  # Metrics endpoint
 
   ws-events:
     build: ./ws-events
     environment:
       REDIS_URL: redis://redis:6379/0
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     ports:
       - "7070:7070"
 
@@ -38,8 +53,10 @@ services:
     environment:
       REST_BASE_URL: http://api-rest:8080
     depends_on:
-      - api-rest
-      - redis
+      api-rest:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   mcp-server-orders:
     build: ./mcp-server-orders
@@ -48,7 +65,8 @@ services:
     environment:
       REDIS_URL: redis://redis:6379/0
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
 
   mcp-host:
     build: ./mcp-host
@@ -58,6 +76,11 @@ services:
       REST_BASE_URL: http://api-rest:8080
       REDIS_URL: redis://redis:6379/0
     depends_on:
-      - mcp-server-catalog
-      - mcp-server-orders
-      - redis
+      api-rest:
+        condition: service_healthy
+      mcp-server-catalog:
+        condition: service_started
+      mcp-server-orders:
+        condition: service_started
+      redis:
+        condition: service_healthy

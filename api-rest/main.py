@@ -1,12 +1,50 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi.responses import Response
 from pydantic import BaseModel
-from typing import List
-import uvicorn, os, json, redis
+from typing import List, Optional
+import uvicorn, os, json, redis, time, logging, sys, uuid
+from contextvars import ContextVar
+import jwt
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+from pythonjsonlogger import jsonlogger
 
+# Configuration
 REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+JWT_SECRET = os.getenv("JWT_SECRET", "")
+JWT_ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
+RATE_LIMIT = os.getenv("RATE_LIMIT", "100/minute")
+AUTH_ENABLED = bool(JWT_SECRET)
+
+# Context for request ID
+request_id_ctx: ContextVar[str] = ContextVar("request_id", default="")
+
+# Structured logging
+logger = logging.getLogger("api-rest")
+logHandler = logging.StreamHandler(sys.stdout)
+formatter = jsonlogger.JsonFormatter(
+    "%(asctime)s %(name)s %(levelname)s %(message)s %(request_id)s %(trace_id)s"
+)
+logHandler.setFormatter(formatter)
+logger.addHandler(logHandler)
+logger.setLevel(logging.INFO)
+
+# Redis
 r = redis.Redis.from_url(REDIS_URL)
 
+# Rate limiter
+limiter = Limiter(key_func=get_remote_address)
+
+# Prometheus metrics
+REQUEST_COUNT = Counter("api_rest_requests_total", "Total requests", ["method", "endpoint", "status"])
+REQUEST_LATENCY = Histogram("api_rest_request_duration_seconds", "Request latency", ["method", "endpoint"])
+ERROR_COUNT = Counter("api_rest_errors_total", "Total errors", ["endpoint"])
+
 app = FastAPI(title="API REST - Catalog/Orders/Users")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 class Product(BaseModel):
     id: int
@@ -15,6 +53,90 @@ class Product(BaseModel):
     stock: int
     category: str | None = None
     description: str | None = None
+
+# JWT Auth dependencies
+def verify_token(request: Request):
+    """Verify JWT token if auth is enabled"""
+    if not AUTH_ENABLED:
+        return {"role": "admin"}  # No auth, full access
+    
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        raise HTTPException(401, "Missing or invalid authorization header")
+    
+    token = auth_header[7:]
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(401, "Token expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(401, "Invalid token")
+
+def require_role(required_role: str):
+    """Dependency to check user role"""
+    def _check_role(user = Depends(verify_token)):
+        role = user.get("role", "viewer")
+        if required_role == "admin" and role != "admin":
+            raise HTTPException(403, "Admin role required")
+        return user
+    return _check_role
+
+# Middleware for request ID and logging
+@app.middleware("http")
+async def logging_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
+    trace_id = request.headers.get("X-Trace-ID", request_id)
+    request_id_ctx.set(request_id)
+    
+    start_time = time.time()
+    method = request.method
+    path = request.url.path
+    
+    logger.info(
+        "Request started",
+        extra={
+            "request_id": request_id,
+            "trace_id": trace_id,
+            "method": method,
+            "path": path,
+        }
+    )
+    
+    try:
+        response = await call_next(request)
+        duration = time.time() - start_time
+        
+        REQUEST_COUNT.labels(method=method, endpoint=path, status=response.status_code).inc()
+        REQUEST_LATENCY.labels(method=method, endpoint=path).observe(duration)
+        
+        logger.info(
+            "Request completed",
+            extra={
+                "request_id": request_id,
+                "trace_id": trace_id,
+                "method": method,
+                "path": path,
+                "status": response.status_code,
+                "duration_ms": round(duration * 1000, 2),
+            }
+        )
+        
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Trace-ID"] = trace_id
+        return response
+    except Exception as e:
+        ERROR_COUNT.labels(endpoint=path).inc()
+        logger.error(
+            f"Request failed: {str(e)}",
+            extra={
+                "request_id": request_id,
+                "trace_id": trace_id,
+                "method": method,
+                "path": path,
+            }
+        )
+        raise
 
 DB_PRODUCTS = {
     1: Product(id=1, name="Laptop Pro", price=1499.0, stock=10, category="laptop", description='15" performance laptop'),
@@ -39,8 +161,25 @@ DB_PRODUCTS = {
     20: Product(id=20, name="Action Cam", price=299.0, stock=65, category="camera", description="4K action camera"),
 }
 
+# Health check
+@app.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    try:
+        r.ping()
+        return {"status": "healthy", "redis": "connected"}
+    except Exception as e:
+        return {"status": "degraded", "redis": "disconnected", "error": str(e)}
+
+# Metrics endpoint
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint"""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
 @app.get("/products", response_model=List[Product])
-def list_products(limit: int | None = None, category: str | None = None):
+@limiter.limit(RATE_LIMIT)
+async def list_products(request: Request, limit: int | None = None, category: str | None = None, user = Depends(verify_token)):
     items = list(DB_PRODUCTS.values())
     if category:
         items = [p for p in items if p.category == category]
@@ -49,14 +188,16 @@ def list_products(limit: int | None = None, category: str | None = None):
     return items
 
 @app.get("/products/{pid}", response_model=Product)
-def get_product(pid: int):
+@limiter.limit(RATE_LIMIT)
+async def get_product(request: Request, pid: int, user = Depends(verify_token)):
     p = DB_PRODUCTS.get(pid)
     if not p:
         raise HTTPException(404, "Not found")
     return p
 
 @app.get("/products/{pid}/recommendations", response_model=List[Product])
-def get_recommendations(pid: int, limit: int = 3):
+@limiter.limit(RATE_LIMIT)
+async def get_recommendations(request: Request, pid: int, limit: int = 3, user = Depends(verify_token)):
     if pid not in DB_PRODUCTS:
         raise HTTPException(404, "Not found")
     category = DB_PRODUCTS[pid].category
@@ -67,7 +208,8 @@ def get_recommendations(pid: int, limit: int = 3):
     return items[:limit]
 
 @app.patch("/products/{pid}", response_model=Product)
-def update_product(pid: int, stock: int | None = None, price: float | None = None):
+@limiter.limit(RATE_LIMIT)
+async def update_product(request: Request, pid: int, stock: int | None = None, price: float | None = None, user = Depends(require_role("admin"))):
     p = DB_PRODUCTS.get(pid)
     if not p:
         raise HTTPException(404, "Not found")
@@ -76,13 +218,13 @@ def update_product(pid: int, stock: int | None = None, price: float | None = Non
         try:
             r.publish("events", json.dumps({"type": "stock_update", "id": pid, "stock": stock}))
         except Exception as e:
-            print("Redis publish stock_update error:", e, flush=True)
+            logger.error(f"Redis publish stock_update error: {e}", extra={"request_id": request_id_ctx.get()})
     if price is not None:
         p.price = price
         try:
             r.publish("events", json.dumps({"type": "price_update", "id": pid, "price": price}))
         except Exception as e:
-            print("Redis publish price_update error:", e, flush=True)
+            logger.error(f"Redis publish price_update error: {e}", extra={"request_id": request_id_ctx.get()})
     return p
 
 if __name__ == "__main__":
